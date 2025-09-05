@@ -214,10 +214,17 @@ class AmplifierPanel(QWidget):
         rf.setLayout(rh); grid.addWidget(rf,1,2)
         v.addLayout(grid)
 
-        self.graph = pg.PlotWidget(); self.graph.setBackground("#111"); self.graph.showGrid(x=True,y=True); self.graph.addLegend()
+        # Enhanced graph setup with legend moved to the right side
+        self.graph = pg.PlotWidget()
+        self.graph.setBackground("#111")
+        self.graph.showGrid(x=True, y=True)
+        self.graph.setMinimumSize(400, 200)  # Ensure minimum size for visibility
+        self.graph.setTitle("Power vs. Time")  # Optional: Add title for clarity
+        self.graph.addLegend(offset=(10, 10))  # Add legend with offset to position it
         self.cur_fwd = self.graph.plot(pen=pg.mkPen('#00e5ff', width=2), name="Forward")
         self.cur_ref = self.graph.plot(pen=pg.mkPen('#ffab00', width=2), name="Reflected")
-        v.addWidget(self.graph,2)
+        self.graph.setYRange(0, 2000, padding=0.1)  # Initial y-range
+        v.addWidget(self.graph, 2)  # Increased stretch factor
 
         bias = QGroupBox("Bias (VG1–VG3)"); bg = QGridLayout()
         bg.addWidget(QLabel("Current:"), 0, 0)
@@ -239,6 +246,14 @@ class AmplifierPanel(QWidget):
 
         self.warn = QLabel(""); self.warn.setStyleSheet("color:#ff5252; font-weight:700;"); v.addWidget(self.warn)
         self.buf_fwd, self.buf_ref = deque(maxlen=200), deque(maxlen=200)
+        self.x_data = deque(maxlen=200)  # Track x-axis (time steps or indices)
+        # Initialize with some dummy data
+        for _ in range(10):
+            self.x_data.append(_)
+            self.buf_fwd.append(random.randint(0, 2000))
+            self.buf_ref.append(random.randint(0, 200))
+        self.cur_fwd.setData(list(self.x_data), list(self.buf_fwd))
+        self.cur_ref.setData(list(self.x_data), list(self.buf_ref))
 
     def apply_fields(self, d: dict):
         self.v28_lbl.setText(f"{d['V28']:.2f} V")
@@ -265,8 +280,18 @@ class AmplifierPanel(QWidget):
             self.warn.setText("⚠️ SHUTDOWN: Unsafe condition detected!")
         else:
             self.warn.setText("")
-        self.buf_fwd.append(d['FWD']); self.buf_ref.append(d['REF'])
-        self.cur_fwd.setData(list(self.buf_fwd)); self.cur_ref.setData(list(self.buf_ref))
+        
+        # Update x-axis and data
+        self.x_data.append(len(self.x_data))
+        self.buf_fwd.append(d['FWD'])
+        self.buf_ref.append(d['REF'])
+        self.cur_fwd.setData(list(self.x_data), list(self.buf_fwd))
+        self.cur_ref.setData(list(self.x_data), list(self.buf_ref))
+        # Adjust ranges dynamically
+        self.graph.setXRange(max(0, len(self.x_data) - 200), len(self.x_data), padding=0)
+        max_y = max(max(self.buf_fwd), max(self.buf_ref)) * 1.1 if self.buf_fwd and self.buf_ref else 2000
+        self.graph.setYRange(0, max_y, padding=0.1)
+        QApplication.processEvents()  # Force GUI update
 
 # ============================================================
 #                     NETWORK ABSTRACTIONS
