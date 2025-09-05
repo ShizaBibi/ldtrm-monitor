@@ -1,0 +1,688 @@
+# mr36_console_188_request_full.py
+# MR-36 Console — Single Amp, LAN + Simulation, 188-byte packet
+# Continuous Mode: 188B frames every 50 ms (simulation)
+# Request Mode: GUI sends request packets; replies only when connected to real hardware
+
+import sys, socket, threading, random
+from collections import deque
+from typing import Tuple
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QTextEdit,
+    QSplitter, QTableWidget, QTableWidgetItem, QCheckBox, QMessageBox,
+    QComboBox
+)
+from PySide6.QtCore import Qt, QTimer, Signal, QObject
+import pyqtgraph as pg
+
+# ---------------- Packet constants ----------------
+SOF = 0xFF
+FRAME_LEN = 188      # continuous full frame
+SEQ_MAX = 0xFF
+
+HDR_M1 = b'M1'
+HDR_D1 = b'D1'
+HDR_D2 = b'D2'
+
+# Short request/response
+REQ_LEN = 7
+RESP_LEN = 11
+CMD_GET = 0x01
+RESP_TAG = 0x02
+
+# ---------------- Utilities ----------------
+def pack_i_d(val: float) -> bytes:
+    """Pack float as 2B int + 2B dec (x100)."""
+    i = int(val); d = int(round((val - i) * 100))
+    if i < 0: i = 0
+    if d < 0: d = 0
+    return i.to_bytes(2, "big") + d.to_bytes(2, "big")
+
+def unpack_i_d(b: bytes, pos: int) -> Tuple[float, int]:
+    i = int.from_bytes(b[pos:pos+2], "big"); pos += 2
+    d = int.from_bytes(b[pos:pos+2], "big"); pos += 2
+    return i + d / 100.0, pos
+
+def crc16_ccitt(data: bytes, poly=0x1021, init=0xFFFF) -> int:
+    crc = init
+    for byte in data:
+        crc ^= (byte << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) & 0xFFFF) ^ poly
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc & 0xFFFF
+
+# ---------------- Build / Parse (188-byte) ----------------
+_seq_counter = 0
+def next_seq() -> int:
+    global _seq_counter
+    _seq_counter = (_seq_counter + 1) & SEQ_MAX
+    return _seq_counter
+
+def build_dummy_188_frame() -> bytes:
+    """Construct a valid 188B full frame: SOF, SEQ, payload, CRC16."""
+    seq = next_seq()
+    payload = bytearray()
+
+    # M1 (2B hdr + 12B values)
+    payload += HDR_M1
+    for _ in range(6):
+        payload += random.randint(0, 0xFFFF).to_bytes(2, "big")
+
+    # D0 (26B): RF, VSWR, 48V, 5V, Temp, Atten, Phase, Reserved(8)
+    rf = random.randint(0, 2000)
+    vswr_x100 = int(random.uniform(100, 210))
+    v48 = pack_i_d(random.uniform(46.0, 49.0))
+    v5 = pack_i_d(random.uniform(4.8, 5.2))
+    temp_d0 = pack_i_d(random.uniform(25.0, 85.0))
+    atten = random.randint(0, 99)
+    phase = random.randint(0, 255)
+    reserved = bytes(random.getrandbits(8) for _ in range(8))
+    payload += rf.to_bytes(2, "big")
+    payload += vswr_x100.to_bytes(2, "big")
+    payload += v48 + v5 + temp_d0
+    payload += bytes([atten & 0xFF]) + bytes([phase & 0xFF])
+    payload += reserved
+
+    # D1 + P1..P5 (72B)
+    payload += HDR_D1
+    for _ in range(5):
+        payload += pack_i_d(random.uniform(25.0, 70.0))  # temp
+        payload += pack_i_d(random.uniform(0.0, 6.5))    # current
+        payload += pack_i_d(random.uniform(20.0, 48.0))  # voltage
+        payload += random.randint(0, 2000).to_bytes(2, "big")  # rf
+
+    # D2 + P6..P10 (72B)
+    payload += HDR_D2
+    for _ in range(5):
+        payload += pack_i_d(random.uniform(25.0, 70.0))
+        payload += pack_i_d(random.uniform(0.0, 6.5))
+        payload += pack_i_d(random.uniform(20.0, 48.0))
+        payload += random.randint(0, 2000).to_bytes(2, "big")
+
+    frame_wo_crc = bytes([SOF, seq]) + bytes(payload)
+    crc = crc16_ccitt(frame_wo_crc[1:])  # CRC over SEQ..end
+    frame = frame_wo_crc + crc.to_bytes(2, "big")
+
+    # Ensure exact 188B
+    if len(frame) < FRAME_LEN:
+        frame = frame + bytes(FRAME_LEN - len(frame))
+    elif len(frame) > FRAME_LEN:
+        frame = frame[:FRAME_LEN]
+    return frame
+
+def parse_188_stream(buf: bytearray):
+    """
+    Consume frames in-place from the front of 'buf'.
+    Returns list of frames parsed (dicts).
+    """
+    frames = []
+    i = 0
+    # Find SOF and ensure enough bytes
+    while True:
+        # sync to SOF
+        while i < len(buf) and buf[i] != SOF:
+            i += 1
+        if i + FRAME_LEN > len(buf):
+            break
+        chunk = bytes(buf[i:i+FRAME_LEN])
+        crc_rx = int.from_bytes(chunk[-2:], "big")
+        crc_calc = crc16_ccitt(chunk[1:-2])
+        if crc_rx != crc_calc:
+            # bad CRC: skip this SOF and search next
+            i += 1
+            continue
+        # Good frame — parse
+        p = 2
+        m1_hdr = chunk[p:p+2]; p += 2
+        m1_vals = [int.from_bytes(chunk[p+k:p+k+2],"big") for k in range(0,12,2)]; p += 12
+        rf = int.from_bytes(chunk[p:p+2], "big"); p += 2
+        vswr = int.from_bytes(chunk[p:p+2], "big") / 100.0; p += 2
+        v48, p = unpack_i_d(chunk, p)
+        v5, p = unpack_i_d(chunk, p)
+        temp_d0, p = unpack_i_d(chunk, p)
+        atten = chunk[p]; p += 1
+        phase = chunk[p]; p += 1
+        reserved = chunk[p:p+8]; p += 8
+
+        d1_hdr = chunk[p:p+2]; p += 2
+        pallets = []
+        for idx in range(5):
+            t, p = unpack_i_d(chunk, p)
+            c, p = unpack_i_d(chunk, p)
+            v, p = unpack_i_d(chunk, p)
+            rf_p = int.from_bytes(chunk[p:p+2], "big"); p += 2
+            pallets.append({"id": idx+1, "temp": t, "curr": c, "volt": v, "rf": rf_p})
+
+        d2_hdr = chunk[p:p+2]; p += 2
+        for idx in range(5):
+            t, p = unpack_i_d(chunk, p)
+            c, p = unpack_i_d(chunk, p)
+            v, p = unpack_i_d(chunk, p)
+            rf_p = int.from_bytes(chunk[p:p+2], "big"); p += 2
+            pallets.append({"id": idx+6, "temp": t, "curr": c, "volt": v, "rf": rf_p})
+
+        frames.append({
+            "seq": chunk[1],
+            "M1_vals": m1_vals,
+            "D0": {"RF": rf, "VSWR": vswr, "V48": v48, "V5": v5, "TEMP": temp_d0, "ATTEN": atten, "PHASE": phase},
+            "Pallets": pallets,
+            "RAW": chunk
+        })
+        # advance buffer
+        del buf[:i+FRAME_LEN]
+        i = 0  # restart search from beginning
+    return frames
+
+# ---------------- Request packet build / parse ----------------
+def build_request_packet(target_id: int, param_id: int) -> bytes:
+    seq = next_seq()
+    body = bytes([seq, CMD_GET, target_id & 0xFF, param_id & 0xFF])
+    crc = crc16_ccitt(body)
+    pkt = bytes([SOF]) + body + crc.to_bytes(2, "big")
+    if len(pkt) < REQ_LEN: pkt = pkt + bytes(REQ_LEN - len(pkt))
+    elif len(pkt) > REQ_LEN: pkt = pkt[:REQ_LEN]
+    return pkt
+
+def parse_response_stream(buf: bytearray):
+    """Consume RESP_LEN frames in-place; return list of responses (dicts)."""
+    resps = []
+    i = 0
+    while True:
+        while i < len(buf) and buf[i] != SOF:
+            i += 1
+        if i + RESP_LEN > len(buf):
+            break
+        chunk = bytes(buf[i:i+RESP_LEN])
+        crc_rx = int.from_bytes(chunk[-2:], "big")
+        crc_calc = crc16_ccitt(chunk[1:-2])
+        if crc_rx != crc_calc:
+            i += 1
+            continue
+        if chunk[2] != RESP_TAG:
+            i += 1
+            continue
+        seq = chunk[1]; target = chunk[3]; param = chunk[4]
+        val_i = int.from_bytes(chunk[5:7], "big")
+        val_d = int.from_bytes(chunk[7:9], "big")
+        value = val_i + val_d / 100.0
+        resps.append({"seq": seq, "target": target, "param": param, "value": value, "RAW": chunk})
+        del buf[:i+RESP_LEN]
+        i = 0
+    return resps
+
+# ---------------- UI widgets ----------------
+def make_card(title, unit=""):
+    box = QGroupBox(title); box.setStyleSheet("QGroupBox{color:#cfd8dc;}")
+    v = QVBoxLayout(box)
+    val = QLabel("--" + (f" {unit}" if unit else "")); val.setAlignment(Qt.AlignCenter)
+    val.setStyleSheet("font-size:15px; font-weight:600; color:#00e676;")  # green-ish text
+    v.addWidget(val)
+    return box, val
+
+class CentralD0(QWidget):
+    def __init__(self):
+        super().__init__()
+        v = QVBoxLayout(self)
+        grid = QGridLayout()
+        names = [("RF Out","W"), ("VSWR",""), ("48V","V"), ("5V","V"),
+                 ("Cab Temp","°C"), ("Atten","dB"), ("Phase","°"), ("Reserved","")]
+        self.fields = {}
+        for i, (n,u) in enumerate(names):
+            box, lbl = make_card(n, u)
+            grid.addWidget(box, i//2, i%2)
+            self.fields[n] = lbl
+        v.addLayout(grid)
+
+        # RF Sum graph (freeze-proof: fixed X range, sliding window)
+        self.graph = pg.PlotWidget()
+        self.graph.setBackground("#111")
+        self.graph.setLabel('left','RF Sum (W)')
+        self.graph.setLabel('bottom','Frames')
+        self.graph.enableAutoRange(False, False)   # stop auto rescales that can stall
+        self.graph.setXRange(0, 600)
+        self.rf_plot = self.graph.plot(pen=pg.mkPen('#00e676', width=2))  # green line
+        self.buf = deque(maxlen=600)
+        v.addWidget(self.graph,1)
+
+    def update(self, d0: dict, rf_sum: float):
+        self.fields["RF Out"].setText(f"{d0['RF']}")
+        self.fields["VSWR"].setText(f"{d0['VSWR']:.2f}")
+        self.fields["48V"].setText(f"{d0['V48']:.2f}")
+        self.fields["5V"].setText(f"{d0['V5']:.2f}")
+        self.fields["Cab Temp"].setText(f"{d0['TEMP']:.2f}")
+        self.fields["Atten"].setText(str(d0['ATTEN']))
+        self.fields["Phase"].setText(str(d0['PHASE']))
+        self.fields["Reserved"].setText("OK")
+        # update graph
+        self.buf.append(rf_sum)
+        self.rf_plot.setData(x=list(range(len(self.buf))), y=list(self.buf))
+
+class DriverPanel(QWidget):
+    def __init__(self, title, ylabel="Value"):
+        super().__init__()
+        v = QVBoxLayout(self)
+        t = QLabel(title); t.setStyleSheet("font-weight:700;"); v.addWidget(t)
+
+        grid = QGridLayout()
+        self.temp_lbl = QLabel("--"); self.curr_lbl = QLabel("--"); self.volt_lbl = QLabel("--"); self.ctrl_lbl = QLabel("--")
+        grid.addWidget(QLabel("Temp"),0,0); grid.addWidget(self.temp_lbl,0,1)
+        grid.addWidget(QLabel("Current"),1,0); grid.addWidget(self.curr_lbl,1,1)
+        grid.addWidget(QLabel("Voltage"),2,0); grid.addWidget(self.volt_lbl,2,1)
+        grid.addWidget(QLabel("Control"),3,0); grid.addWidget(self.ctrl_lbl,3,1)
+        v.addLayout(grid)
+
+        # graph
+        self.graph = pg.PlotWidget()
+        self.graph.setBackground("#111")
+        self.graph.setLabel('bottom','Frames'); self.graph.setLabel('left', ylabel)
+        self.graph.enableAutoRange(False, False)
+        self.graph.setXRange(0, 600)
+        self.curve = self.graph.plot(pen=pg.mkPen('#00e676', width=2))  # green line
+        self.trend = deque(maxlen=600)
+        v.addWidget(self.graph,1)
+
+    def update(self, temp=None, curr=None, volt=None, ctrl=None, plot_val=None):
+        if temp is not None: self.temp_lbl.setText(f"{temp:.2f} °C")
+        if curr is not None: self.curr_lbl.setText(f"{curr:.2f} A")
+        if volt is not None: self.volt_lbl.setText(f"{volt:.2f} V")
+        if ctrl is not None: self.ctrl_lbl.setText(f"0x{ctrl:04X}")
+        if plot_val is not None:
+            self.trend.append(plot_val)
+            self.curve.setData(x=list(range(len(self.trend))), y=list(self.trend))
+
+class PalletTable(QTableWidget):
+    def __init__(self):
+        super().__init__(10,5)
+        self.setHorizontalHeaderLabels(["P#","Temp (°C)","Current (A)","Voltage (V)","RF (W)"])
+        for r in range(10):
+            for c in range(5):
+                self.setItem(r, c, QTableWidgetItem("--"))
+        self.setAlternatingRowColors(True)
+        self.resizeColumnsToContents()
+    def update(self, pls):
+        for i,p in enumerate(pls):
+            self.item(i,0).setText(str(p["id"]))
+            self.item(i,1).setText(f"{p['temp']:.2f}")
+            self.item(i,2).setText(f"{p['curr']:.2f}")
+            self.item(i,3).setText(f"{p['volt']:.2f}")
+            self.item(i,4).setText(str(p['rf']))
+
+# ---------------- Networking threads ----------------
+class NetSignals(QObject):
+    bytes_rx = Signal(bytes)
+    state = Signal(bool, str)
+
+class TcpClient(threading.Thread):
+    def __init__(self, host, port, sig: NetSignals):
+        super().__init__(daemon=True); self.host=host; self.port=port; self.sig=sig
+        self._stop = threading.Event(); self.sock = None
+    def run(self):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(5); self.sock.connect((self.host, self.port))
+            self.sock.settimeout(0.25); self.sig.state.emit(True, f"TCP Client connected {self.host}:{self.port}")
+            while not self._stop.is_set():
+                try:
+                    d = self.sock.recv(4096)
+                    if not d: break
+                    self.sig.bytes_rx.emit(d)
+                except socket.timeout:
+                    continue
+        except Exception as e:
+            self.sig.state.emit(False, f"TCP Client error: {e}")
+        finally:
+            try:
+                if self.sock: self.sock.close()
+            except: pass
+            self.sig.state.emit(False, "TCP Client disconnected")
+    def send(self, b: bytes):
+        try:
+            if self.sock: self.sock.sendall(b)
+        except: pass
+    def stop(self): self._stop.set()
+
+class TcpServer(threading.Thread):
+    def __init__(self, port, sig: NetSignals):
+        super().__init__(daemon=True); self.port = port; self.sig = sig
+        self._stop = threading.Event(); self.srv = None; self.cli = None
+    def run(self):
+        try:
+            self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.srv.bind(("", self.port)); self.srv.listen(1)
+            self.srv.settimeout(0.5)
+            self.sig.state.emit(True, f"TCP Server listening {self.port}")
+            while not self._stop.is_set():
+                if not self.cli:
+                    try:
+                        c, addr = self.srv.accept(); c.settimeout(0.25); self.cli = c
+                        self.sig.state.emit(True, f"TCP Server client {addr}")
+                    except socket.timeout:
+                        continue
+                else:
+                    try:
+                        d = self.cli.recv(4096)
+                        if not d: self.cli.close(); self.cli = None; continue
+                        self.sig.bytes_rx.emit(d)
+                    except socket.timeout:
+                        continue
+        except Exception as e:
+            self.sig.state.emit(False, f"TCP Server error: {e}")
+        finally:
+            try:
+                if self.cli: self.cli.close()
+                if self.srv: self.srv.close()
+            except: pass
+            self.sig.state.emit(False, "TCP Server stopped")
+    def send(self, b: bytes):
+        try:
+            if self.cli: self.cli.sendall(b)
+        except: pass
+    def stop(self): self._stop.set()
+
+class UdpNode(threading.Thread):
+    def __init__(self, lport, rip, rport, sig: NetSignals):
+        super().__init__(daemon=True); self.lp = lport; self.rip = rip; self.rp = rport; self.sig = sig
+        self._stop = threading.Event(); self.sock = None; self.peer = None
+    def run(self):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.bind(("", self.lp))
+            self.sock.settimeout(0.25)
+            self.sig.state.emit(True, f"UDP bound {self.lp}")
+            while not self._stop.is_set():
+                try:
+                    d, addr = self.sock.recvfrom(4096)
+                    self.sig.bytes_rx.emit(d)
+                    if not self.peer: self.peer = addr
+                except socket.timeout:
+                    continue
+        except Exception as e:
+            self.sig.state.emit(False, f"UDP error: {e}")
+        finally:
+            try:
+                if self.sock: self.sock.close()
+            except: pass
+            self.sig.state.emit(False, "UDP stopped")
+    def send(self, b: bytes):
+        try:
+            if self.sock:
+                dst = self.peer if self.peer else (self.rip, self.rp)
+                self.sock.sendto(b, dst)
+        except: pass
+    def stop(self): self._stop.set()
+
+# ---------------- MainWindow ----------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MR-36 Console (188B) — Continuous + Request")
+        self.resize(1400, 920)
+        central = QWidget(); self.setCentralWidget(central); v = QVBoxLayout(central)
+
+        # Top bar: Simulation + Operation + network settings
+        top = QHBoxLayout()
+        self.sim_chk = QCheckBox("Simulation"); self.sim_chk.setChecked(True); top.addWidget(self.sim_chk)
+
+        top.addSpacing(10)
+        top.addWidget(QLabel("Operation:"))
+        self.op_combo = QComboBox(); self.op_combo.addItems(["Continuous", "Request"])
+        self.op_combo.currentTextChanged.connect(self.on_op_change)
+        top.addWidget(self.op_combo)
+
+        top.addStretch()
+        self.mode_combo = QComboBox(); self.mode_combo.addItems(["TCP Client","TCP Server","UDP"]); top.addWidget(self.mode_combo)
+        top.addWidget(QLabel("Local:")); self.local_port = QLineEdit("5000"); self.local_port.setFixedWidth(80); top.addWidget(self.local_port)
+        top.addWidget(QLabel("Remote IP:")); self.remote_ip = QLineEdit("127.0.0.1"); self.remote_ip.setFixedWidth(120); top.addWidget(self.remote_ip)
+        top.addWidget(QLabel("Port:")); self.remote_port = QLineEdit("5000"); self.remote_port.setFixedWidth(80); top.addWidget(self.remote_port)
+        self.btn_conn = QPushButton("Connect"); self.btn_conn.clicked.connect(self.toggle_conn); top.addWidget(self.btn_conn)
+        v.addLayout(top)
+
+        # Main split
+        split = QSplitter(Qt.Horizontal); v.addWidget(split, 1)
+
+        # Left: D0 (top) + three drivers (bottom, side-by-side). Adjustable with vertical splitter.
+        left_split = QSplitter(Qt.Vertical)
+
+        self.d0_panel = CentralD0()
+        left_split.addWidget(self.d0_panel)
+
+        drivers_widget = QWidget(); dh = QHBoxLayout(drivers_widget); dh.setContentsMargins(0,0,0,0)
+        self.dr0 = DriverPanel("Driver 0", ylabel="RF / Frames")
+        self.dr1 = DriverPanel("Driver 1", ylabel="Current (A)")
+        self.dr2 = DriverPanel("Driver 2", ylabel="Voltage (V)")
+        dh.addWidget(self.dr0, 1); dh.addWidget(self.dr1, 1); dh.addWidget(self.dr2, 1)
+        left_split.addWidget(drivers_widget)
+
+        split.addWidget(left_split)
+
+        # Right: pallets, request box, send row, logs
+        right_widget = QWidget(); rv = QVBoxLayout(right_widget)
+
+        self.pallet_table = PalletTable(); rv.addWidget(self.pallet_table, 2)
+
+        # Request panel (visible in Request mode)
+        req_box = QGroupBox("Request Panel"); req_layout = QHBoxLayout(req_box)
+        req_layout.addWidget(QLabel("Target:"))
+        self.target_combo = QComboBox()
+        self.target_combo.addItems(["Driver0","Driver1","Driver2"] + [f"P{n}" for n in range(1,11)])
+        req_layout.addWidget(self.target_combo)
+        req_layout.addWidget(QLabel("Parameter:"))
+        self.param_combo = QComboBox(); self.param_combo.addItems(["Temp","Curr","Volt","RF"])
+        req_layout.addWidget(self.param_combo)
+        self.btn_request = QPushButton("Send Request"); self.btn_request.clicked.connect(self.send_request)
+        req_layout.addWidget(self.btn_request)
+        self.response_lbl = QLabel("Response: --"); self.response_lbl.setStyleSheet("font-weight:700; color:#82B1FF;")
+        req_layout.addWidget(self.response_lbl)
+        rv.addWidget(req_box, 0)
+
+        # Send area + manual hex
+        send_row = QHBoxLayout()
+        self.hex_in = QLineEdit("FF ..."); send_row.addWidget(self.hex_in, 1)
+        self.hex_chk = QCheckBox("HEX"); self.hex_chk.setChecked(True); send_row.addWidget(self.hex_chk)
+        self.hex_verbose = QCheckBox("HEX raw"); self.hex_verbose.setChecked(False); send_row.addWidget(self.hex_verbose)
+        self.btn_send = QPushButton("Send"); self.btn_send.clicked.connect(self.do_send); send_row.addWidget(self.btn_send)
+        self.btn_send_dummy = QPushButton("Send Dummy"); self.btn_send_dummy.clicked.connect(self.send_dummy); send_row.addWidget(self.btn_send_dummy)
+        rv.addLayout(send_row)
+
+        # Log
+        self.log = QTextEdit(); self.log.setReadOnly(True); rv.addWidget(self.log, 1)
+
+        split.addWidget(right_widget)
+        split.setSizes([900, 500])
+
+        # Signals and network state
+        self.signals = NetSignals()
+        self.signals.bytes_rx.connect(self.on_network_bytes)
+        self.signals.state.connect(self.on_state)
+        self.net_thread = None
+
+        # RX buffer (shared for continuous + responses)
+        self.rx_buffer = bytearray()
+
+        # Timer for simulation (50 ms)
+        self.timer = QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(50)
+
+        # Start in Continuous mode
+        self.on_op_change(self.op_combo.currentText())
+
+    # ---------- UI actions ----------
+    def on_op_change(self, text: str):
+        is_req = (text == "Request")
+        self.target_combo.setEnabled(is_req)
+        self.param_combo.setEnabled(is_req)
+        self.btn_request.setEnabled(is_req)
+        self.response_lbl.setVisible(is_req)
+
+    def tick(self):
+        """Simulation (Continuous mode only): push a dummy 188B frame every 50 ms."""
+        if self.sim_chk.isChecked() and self.op_combo.currentText() == "Continuous":
+            self.signals.bytes_rx.emit(build_dummy_188_frame())
+
+    # ---------- Networking ----------
+    def toggle_conn(self):
+        if self.net_thread:
+            try: self.net_thread.stop()
+            except: pass
+            self.net_thread = None
+            self.btn_conn.setText("Connect")
+            return
+
+        if self.sim_chk.isChecked():
+            QMessageBox.information(self, "Simulation ON", "Disable Simulation to open sockets.")
+            return
+
+        # make a thread based on mode
+        mode = self.mode_combo.currentText()
+        try:
+            lp = int(self.local_port.text()); rp = int(self.remote_port.text())
+        except:
+            QMessageBox.warning(self, "Ports", "Invalid ports"); return
+        rip = self.remote_ip.text().strip()
+
+        if mode == "TCP Client":
+            self.net_thread = TcpClient(rip, rp, self.signals)
+        elif mode == "TCP Server":
+            self.net_thread = TcpServer(lp, self.signals)
+        else:
+            self.net_thread = UdpNode(lp, rip, rp, self.signals)
+
+        self.net_thread.start()
+        self.btn_conn.setText("Disconnect")
+
+    def on_state(self, ok: bool, msg: str):
+        self.append_log(msg)
+
+    # ---------- Send / Request ----------
+    def do_send(self):
+        txt = self.hex_in.text().strip()
+        if self.hex_chk.isChecked():
+            cleaned = txt.replace(" ", "").replace(",", "")
+            if len(cleaned) % 2 != 0:
+                QMessageBox.warning(self, "HEX", "Hex length must be even"); return
+            try:
+                data = bytes.fromhex(cleaned)
+            except Exception:
+                QMessageBox.warning(self, "HEX", "Invalid hex"); return
+            self.send_bytes(data)
+        else:
+            self.send_bytes(txt.encode("utf-8"))
+
+    def send_dummy(self):
+        pkt = build_dummy_188_frame()
+        self.send_bytes(pkt)
+
+    def send_bytes(self, b: bytes):
+        if self.sim_chk.isChecked():
+            # loopback and show TX in green
+            self.append_log(f"[SIM TX] {b.hex(' ')}", color="green" if self.hex_verbose.isChecked() else None)
+            self.signals.bytes_rx.emit(b)
+            return
+        if not self.net_thread:
+            QMessageBox.information(self, "Not connected", "Open a socket or enable simulation"); return
+        try:
+            self.net_thread.send(b)
+            self.append_log(f"[TX] {b.hex(' ')}", color=None if not self.hex_verbose.isChecked() else "green")
+        except Exception as e:
+            self.append_log(f"[TX-ERR] {e}", color="red")
+
+    def send_request(self):
+        """Only valid with real connection (simulation does not generate short responses)."""
+        if self.sim_chk.isChecked():
+            QMessageBox.information(self, "Request Mode", "Disable Simulation and connect to hardware for request/response.")
+            return
+        if not self.net_thread:
+            QMessageBox.information(self, "Not connected", "Connect a socket first."); return
+
+        target_text = self.target_combo.currentText()
+        param_text = self.param_combo.currentText()
+        if target_text.startswith("Driver"):
+            tid = 0x10 + int(target_text[-1])      # Driver0 -> 0x10 etc.
+        else:
+            pid_num = int(target_text.lstrip("P")) # P1..P10 -> 0x20..0x29
+            tid = 0x20 + (pid_num - 1)
+        pmap = {"Temp":1, "Curr":2, "Volt":3, "RF":4}
+        param_id = pmap.get(param_text, 1)
+
+        pkt = build_request_packet(tid, param_id)
+        try:
+            self.net_thread.send(pkt)
+            self.append_log(f"[REQ] {pkt.hex(' ')}", color="blue")
+        except Exception as e:
+            self.append_log(f"[REQ-ERR] {e}", color="red")
+
+    # ---------- RX pipeline ----------
+    def on_network_bytes(self, b: bytes):
+        self.rx_buffer.extend(b)
+        # Parse continuous frames first
+        frames = parse_188_stream(self.rx_buffer)
+        for f in frames:
+            rf_sum = sum(p["rf"] for p in f["Pallets"])
+            # D0
+            self.d0_panel.update(f["D0"], rf_sum)
+            # Drivers:
+            # Driver 0 → show D0 temp/V48 and plot RF sum
+            self.dr0.update(temp=f["D0"]["TEMP"], curr=0.0, volt=f["D0"]["V48"], ctrl=0, plot_val=rf_sum)
+            # Driver 1 → map to Pallet 1 values, plot current
+            if len(f["Pallets"]) >= 1:
+                p1 = f["Pallets"][0]
+                self.dr1.update(temp=p1["temp"], curr=p1["curr"], volt=p1["volt"], ctrl=0, plot_val=p1["curr"])
+            # Driver 2 → map to Pallet 2 values, plot voltage
+            if len(f["Pallets"]) >= 2:
+                p2 = f["Pallets"][1]
+                self.dr2.update(temp=p2["temp"], curr=p2["curr"], volt=p2["volt"], ctrl=0, plot_val=p2["volt"])
+            # Pallets table
+            self.pallet_table.update(f["Pallets"])
+
+            # Log continuous packet in GREEN, minimal text by default
+            if self.hex_verbose.isChecked():
+                self.append_log(f"[CONT] SEQ={f['seq']} RFsum={rf_sum:.0f} raw:{f['RAW'].hex(' ')}", color="green")
+            else:
+                self.append_log(f"[CONT] SEQ={f['seq']} RFsum={rf_sum:.0f}", color="green")
+
+        # Then parse any short responses (when in Request mode with real HW)
+        resps = parse_response_stream(self.rx_buffer)
+        for r in resps:
+            self.response_lbl.setText(f"Response: {r['value']:.2f}")
+            if self.hex_verbose.isChecked():
+                self.append_log(f"[RESP] target=0x{r['target']:02X} param={r['param']} value={r['value']:.2f} raw:{r['RAW'].hex(' ')}", color="blue")
+            else:
+                self.append_log(f"[RESP] target=0x{r['target']:02X} param={r['param']} value={r['value']:.2f}", color="blue")
+
+        # Keep buffer bounded
+        if len(self.rx_buffer) > (1<<20):
+            self.rx_buffer = self.rx_buffer[-(1<<20):]
+
+    # ---------- Logging helper ----------
+    def append_log(self, text: str, color: str = None):
+        # throttle: keep max ~1000 lines
+        if self.log.document().blockCount() > 1000:
+            self.log.clear()
+
+        if color == "green":
+            self.log.setTextColor(Qt.darkGreen)
+        elif color == "blue":
+            self.log.setTextColor(Qt.blue)
+        elif color == "red":
+            self.log.setTextColor(Qt.red)
+        else:
+            self.log.setTextColor(Qt.white)
+        self.log.append(text)
+        self.log.setTextColor(Qt.white)
+
+    def closeEvent(self, e):
+        if self.net_thread:
+            try: self.net_thread.stop()
+            except: pass
+        e.accept()
+
+# ---------------- ENTRY ----------------
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    pg.setConfigOptions(antialias=True)
+    win = MainWindow(); win.show()
+    sys.exit(app.exec())
+    
